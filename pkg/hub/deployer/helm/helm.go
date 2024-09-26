@@ -18,14 +18,9 @@ package helm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
-	"strings"
-	"sync"
 
-	"helm.sh/helm/v3/pkg/getter"
-	"helm.sh/helm/v3/pkg/repo"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,7 +37,6 @@ import (
 
 	appsapi "github.com/clusternet/clusternet/pkg/apis/apps/v1alpha1"
 	"github.com/clusternet/clusternet/pkg/controllers/apps/description"
-	"github.com/clusternet/clusternet/pkg/controllers/apps/helmchart"
 	"github.com/clusternet/clusternet/pkg/controllers/apps/helmrelease"
 	"github.com/clusternet/clusternet/pkg/controllers/misc/secret"
 	clusternetclientset "github.com/clusternet/clusternet/pkg/generated/clientset/versioned"
@@ -54,15 +48,10 @@ import (
 )
 
 var (
-	helmChartKind    = appsapi.SchemeGroupVersion.WithKind("HelmChart")
-	descriptionKind  = appsapi.SchemeGroupVersion.WithKind("Description")
-	subscriptionKind = appsapi.SchemeGroupVersion.WithKind("Subscription")
+	descriptionKind = appsapi.SchemeGroupVersion.WithKind("Description")
 )
 
 type Deployer struct {
-	ctx context.Context
-
-	helmChartController   *helmchart.Controller
 	helmReleaseController *helmrelease.Controller
 	descriptionController *description.Controller
 
@@ -77,8 +66,6 @@ type Deployer struct {
 	hrSynced      cache.InformerSynced
 	descLister    applisters.DescriptionLister
 	descSynced    cache.InformerSynced
-	subLister     applisters.SubscriptionLister
-	subSynced     cache.InformerSynced
 	clusterLister clusterlisters.ManagedClusterLister
 	clusterSynced cache.InformerSynced
 
@@ -88,14 +75,12 @@ type Deployer struct {
 	recorder record.EventRecorder
 }
 
-func NewDeployer(ctx context.Context,
-	clusternetClient *clusternetclientset.Clientset, kubeClient *kubernetes.Clientset,
+func NewDeployer(clusternetClient *clusternetclientset.Clientset, kubeClient *kubernetes.Clientset,
 	clusternetInformerFactory clusternetinformers.SharedInformerFactory,
 	kubeInformerFactory kubeinformers.SharedInformerFactory,
-	feedInUseProtection bool, recorder record.EventRecorder) (*Deployer, error) {
+	recorder record.EventRecorder) (*Deployer, error) {
 
 	deployer := &Deployer{
-		ctx:              ctx,
 		clusternetClient: clusternetClient,
 		kubeClient:       kubeClient,
 		chartLister:      clusternetInformerFactory.Apps().V1alpha1().HelmCharts().Lister(),
@@ -104,8 +89,6 @@ func NewDeployer(ctx context.Context,
 		hrSynced:         clusternetInformerFactory.Apps().V1alpha1().HelmReleases().Informer().HasSynced,
 		descLister:       clusternetInformerFactory.Apps().V1alpha1().Descriptions().Lister(),
 		descSynced:       clusternetInformerFactory.Apps().V1alpha1().Descriptions().Informer().HasSynced,
-		subLister:        clusternetInformerFactory.Apps().V1alpha1().Subscriptions().Lister(),
-		subSynced:        clusternetInformerFactory.Apps().V1alpha1().Subscriptions().Informer().HasSynced,
 		clusterLister:    clusternetInformerFactory.Clusters().V1beta1().ManagedClusters().Lister(),
 		clusterSynced:    clusternetInformerFactory.Clusters().V1beta1().ManagedClusters().Informer().HasSynced,
 		secretLister:     kubeInformerFactory.Core().V1().Secrets().Lister(),
@@ -113,17 +96,7 @@ func NewDeployer(ctx context.Context,
 		recorder:         recorder,
 	}
 
-	helmChartController, err := helmchart.NewController(ctx, clusternetClient,
-		clusternetInformerFactory.Apps().V1alpha1().HelmCharts(),
-		feedInUseProtection,
-		deployer.recorder, deployer.handleHelmChart)
-	if err != nil {
-		return nil, err
-	}
-	deployer.helmChartController = helmChartController
-
-	hrController, err := helmrelease.NewController(ctx,
-		clusternetClient,
+	hrController, err := helmrelease.NewController(clusternetClient,
 		clusternetInformerFactory.Apps().V1alpha1().Descriptions(),
 		clusternetInformerFactory.Apps().V1alpha1().HelmReleases(),
 		deployer.recorder,
@@ -133,8 +106,7 @@ func NewDeployer(ctx context.Context,
 	}
 	deployer.helmReleaseController = hrController
 
-	secretController, err := secret.NewController(ctx,
-		kubeClient,
+	secretController, err := secret.NewController(kubeClient,
 		kubeInformerFactory.Core().V1().Secrets(),
 		deployer.recorder,
 		deployer.handleSecret)
@@ -143,8 +115,7 @@ func NewDeployer(ctx context.Context,
 	}
 	deployer.secretController = secretController
 
-	descController, err := description.NewController(ctx,
-		clusternetClient,
+	descController, err := description.NewController(clusternetClient,
 		clusternetInformerFactory.Apps().V1alpha1().Descriptions(),
 		clusternetInformerFactory.Apps().V1alpha1().HelmReleases(),
 		deployer.recorder,
@@ -157,30 +128,28 @@ func NewDeployer(ctx context.Context,
 	return deployer, nil
 }
 
-func (deployer *Deployer) Run(workers int) {
+func (deployer *Deployer) Run(workers int, stopCh <-chan struct{}) {
 	klog.Info("starting helm deployer...")
 	defer klog.Info("shutting helm deployer")
 
 	// Wait for the caches to be synced before starting workers
-	klog.V(5).Info("waiting for informer caches to sync")
-	if !cache.WaitForCacheSync(deployer.ctx.Done(),
+	if !cache.WaitForNamedCacheSync("helm-deployer",
+		stopCh,
 		deployer.chartSynced,
 		deployer.hrSynced,
 		deployer.descSynced,
-		deployer.subSynced,
 		deployer.clusterSynced,
 		deployer.secretSynced,
 	) {
 		return
 	}
 
-	go deployer.helmChartController.Run(workers, deployer.ctx.Done())
-	go deployer.helmReleaseController.Run(workers, deployer.ctx.Done())
-	go deployer.descriptionController.Run(workers, deployer.ctx.Done())
+	go deployer.helmReleaseController.Run(workers, stopCh)
+	go deployer.descriptionController.Run(workers, stopCh)
 	// 1 worker may get hang up, so we set minimum 2 workers here
-	go deployer.secretController.Run(2, deployer.ctx.Done())
+	go deployer.secretController.Run(2, stopCh)
 
-	<-deployer.ctx.Done()
+	<-stopCh
 }
 
 func (deployer *Deployer) handleDescription(desc *appsapi.Description) error {
@@ -240,8 +209,9 @@ func (deployer *Deployer) handleDescription(desc *appsapi.Description) error {
 			return fmt.Errorf("waiting for HelmRelease belongs to Description %s getting deleted", klog.KObj(desc))
 		}
 
-		desc.Finalizers = utils.RemoveString(desc.Finalizers, known.AppFinalizer)
-		_, err = deployer.clusternetClient.AppsV1alpha1().Descriptions(desc.Namespace).Update(context.TODO(), desc, metav1.UpdateOptions{})
+		descCopy := desc.DeepCopy()
+		descCopy.Finalizers = utils.RemoveString(descCopy.Finalizers, known.AppFinalizer)
+		_, err = deployer.clusternetClient.AppsV1alpha1().Descriptions(descCopy.Namespace).Update(context.TODO(), descCopy, metav1.UpdateOptions{})
 		if err != nil {
 			klog.WarningDepth(4,
 				fmt.Sprintf("failed to remove finalizer %s from Description %s: %v", known.AppFinalizer, klog.KObj(desc), err))
@@ -249,50 +219,14 @@ func (deployer *Deployer) handleDescription(desc *appsapi.Description) error {
 		return err
 	}
 
-	if err := deployer.PopulateHelmRelease(desc); err != nil {
+	if err := deployer.populateHelmRelease(desc); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (deployer *Deployer) handleHelmChart(chart *appsapi.HelmChart) error {
-	klog.V(5).Infof("handle HelmChart %s", klog.KObj(chart))
-	if chart.DeletionTimestamp != nil {
-		if err := deployer.protectHelmChartFeed(chart); err != nil {
-			return err
-		}
-
-		// remove finalizers
-		chart.Finalizers = utils.RemoveString(chart.Finalizers, known.AppFinalizer)
-		chart.Finalizers = utils.RemoveString(chart.Finalizers, known.FeedProtectionFinalizer)
-		_, err := deployer.clusternetClient.AppsV1alpha1().HelmCharts(chart.Namespace).Update(context.TODO(), chart, metav1.UpdateOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
-			klog.WarningDepth(4,
-				fmt.Sprintf("failed to remove finalizers from HelmChart %s: %v", klog.KObj(chart), err))
-		}
-		return err
-	}
-
-	_, err := repo.FindChartInRepoURL(chart.Spec.Repository, chart.Spec.Chart, chart.Spec.ChartVersion,
-		"", "", "",
-		getter.All(utils.Settings))
-	if err != nil {
-		// failed to find chart
-		return deployer.helmChartController.UpdateChartStatus(chart, &appsapi.HelmChartStatus{
-			Phase:  appsapi.HelmChartNotFound,
-			Reason: err.Error(),
-		})
-	}
-	return deployer.helmChartController.UpdateChartStatus(chart, &appsapi.HelmChartStatus{
-		Phase: appsapi.HelmChartFound,
-	})
-}
-
-func (deployer *Deployer) PopulateHelmRelease(desc *appsapi.Description) error {
+func (deployer *Deployer) populateHelmRelease(desc *appsapi.Description) error {
 	allExistingHelmReleases, err := deployer.hrLister.List(labels.SelectorFromSet(labels.Set{
 		known.ConfigKindLabel:      desc.Kind,
 		known.ConfigNameLabel:      desc.Name,
@@ -381,22 +315,23 @@ func (deployer *Deployer) syncHelmRelease(desc *appsapi.Description, helmRelease
 
 		// update it
 		if !reflect.DeepEqual(hr.Spec, helmRelease.Spec) {
-			if hr.Labels == nil {
-				hr.Labels = make(map[string]string)
+			hrCopy := hr.DeepCopy()
+			if hrCopy.Labels == nil {
+				hrCopy.Labels = make(map[string]string)
 			}
 			for key, value := range helmRelease.Labels {
-				hr.Labels[key] = value
+				hrCopy.Labels[key] = value
 			}
 
-			hr.Spec = helmRelease.Spec
-			if !utils.ContainsString(hr.Finalizers, known.AppFinalizer) {
-				hr.Finalizers = append(hr.Finalizers, known.AppFinalizer)
+			hrCopy.Spec = helmRelease.Spec
+			if !utils.ContainsString(hrCopy.Finalizers, known.AppFinalizer) {
+				hrCopy.Finalizers = append(hrCopy.Finalizers, known.AppFinalizer)
 			}
 
-			_, err = deployer.clusternetClient.AppsV1alpha1().HelmReleases(hr.Namespace).Update(context.TODO(),
-				hr, metav1.UpdateOptions{})
+			_, err = deployer.clusternetClient.AppsV1alpha1().HelmReleases(hrCopy.Namespace).Update(context.TODO(),
+				hrCopy, metav1.UpdateOptions{})
 			if err == nil {
-				msg := fmt.Sprintf("HelmReleases %s is updated successfully", klog.KObj(hr))
+				msg := fmt.Sprintf("HelmReleases %s is updated successfully", klog.KObj(hrCopy))
 				klog.V(4).Info(msg)
 				deployer.recorder.Event(desc, corev1.EventTypeNormal, "HelmReleaseUpdated", msg)
 			}
@@ -459,7 +394,7 @@ func (deployer *Deployer) handleHelmRelease(hr *appsapi.HelmRelease) error {
 		return err
 	}
 
-	return utils.ReconcileHelmRelease(deployer.ctx, deployCtx, deployer.clusternetClient,
+	return utils.ReconcileHelmRelease(context.TODO(), deployCtx, deployer.clusternetClient,
 		deployer.hrLister, deployer.descLister, hr, deployer.recorder)
 }
 
@@ -483,100 +418,15 @@ func (deployer *Deployer) handleSecret(secret *corev1.Secret) error {
 		return fmt.Errorf("waiting all HelmReleases in namespace %s get cleanedup", secret.Namespace)
 	}
 
-	secret.Finalizers = utils.RemoveString(secret.Finalizers, known.AppFinalizer)
-	_, err = deployer.kubeClient.CoreV1().Secrets(secret.Namespace).Update(context.TODO(), secret, metav1.UpdateOptions{})
+	secretCopy := secret.DeepCopy()
+	secretCopy.Finalizers = utils.RemoveString(secretCopy.Finalizers, known.AppFinalizer)
+	_, err = deployer.kubeClient.CoreV1().Secrets(secretCopy.Namespace).Update(context.TODO(), secretCopy, metav1.UpdateOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
 		klog.WarningDepth(4,
-			fmt.Sprintf("failed to remove finalizer %s from Secrets %s: %v", known.AppFinalizer, klog.KObj(secret), err))
+			fmt.Sprintf("failed to remove finalizer %s from Secrets %s: %v", known.AppFinalizer, klog.KObj(secretCopy), err))
 	}
 	return err
-}
-
-func (deployer *Deployer) protectHelmChartFeed(chart *appsapi.HelmChart) error {
-	// search all Subscriptions UID that referring this HelmChart
-	subUIDs := sets.String{}
-	for key, val := range chart.Labels {
-		// normally the length of a uuid is 36
-		if len(key) != 36 || strings.Contains(key, "/") {
-			continue
-		}
-		if val == subscriptionKind.Kind {
-			subUIDs.Insert(key)
-		}
-	}
-
-	var allRelatedSubscriptions []*appsapi.Subscription
-	var allSubInfos []string
-	// we just list all Subscriptions and filter them with matching UID,
-	// since using label selector one by one does not improve too much performance
-	subscriptions, err := deployer.subLister.List(labels.Everything())
-	if err != nil {
-		return err
-	}
-	for _, sub := range subscriptions {
-		// in case some subscriptions do not exist any more, while labels still persist
-		if subUIDs.Has(string(sub.UID)) && sub.DeletionTimestamp == nil {
-			// perform strictly check
-			// whether this HelmChart is still referred as a feed in Subscription
-			for _, feed := range sub.Spec.Feeds {
-				if feed.Kind != helmChartKind.Kind {
-					continue
-				}
-				if feed.Namespace != chart.Namespace {
-					continue
-				}
-				if feed.Name != chart.Name {
-					continue
-				}
-				allRelatedSubscriptions = append(allRelatedSubscriptions, sub)
-				allSubInfos = append(allSubInfos, klog.KObj(sub).String())
-				break
-			}
-		}
-	}
-
-	// block HelmChart deletion until all Subscriptions that refer this Feed get deleted
-	if utils.ContainsString(chart.Finalizers, known.FeedProtectionFinalizer) && len(allRelatedSubscriptions) > 0 {
-		msg := fmt.Sprintf("block deleting current HelmChart until all Subscriptions (including %s) that refer this as a feed get deleted",
-			strings.Join(allSubInfos, ", "))
-		klog.WarningDepth(5, msg)
-
-		annotationsToPatch := map[string]*string{}
-		annotationsToPatch[known.FeedProtectionAnnotation] = utilpointer.StringPtr(msg)
-		if err := utils.PatchHelmChartLabelsAndAnnotations(deployer.clusternetClient, chart,
-			nil, annotationsToPatch); err != nil {
-			return err
-		}
-
-		return errors.New(msg)
-	}
-
-	// finalizer FeedProtectionFinalizer does not exist,
-	// so we just remove this feed from all Subscriptions
-	wg := sync.WaitGroup{}
-	wg.Add(len(allRelatedSubscriptions))
-	errCh := make(chan error, len(allRelatedSubscriptions))
-	for _, sub := range allRelatedSubscriptions {
-		go func(sub *appsapi.Subscription) {
-			defer wg.Done()
-
-			if err := utils.RemoveFeedFromSubscription(context.TODO(),
-				deployer.clusternetClient, chart.GetLabels(), sub); err != nil {
-				errCh <- err
-			}
-		}(sub)
-	}
-
-	wg.Wait()
-
-	// collect errors
-	close(errCh)
-	var allErrs []error
-	for err := range errCh {
-		allErrs = append(allErrs, err)
-	}
-	return utilerrors.NewAggregate(allErrs)
 }
